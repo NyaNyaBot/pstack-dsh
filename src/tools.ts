@@ -116,6 +116,37 @@ export function overlayWriteTool(host: ToolHost): ToolDefinition {
   }
 }
 
+/**
+ * DSH 0.2.1-rc.2 compatibility shim. This build exposes
+ * ctx.subagents.startActivation() (one-shot activation whose result is delivered
+ * to the parent as a message) but not the start(provider, request) run handle
+ * pstack 0.2.5 calls. Background spawns map one to one; a foreground spawn
+ * degrades to a detached activation whose result arrives as a parent message.
+ */
+async function startPstackRun(
+  subagents: NonNullable<ToolHost['subagents']>,
+  providerName: string,
+  request: Record<string, unknown>,
+): Promise<{ detached: boolean; run: { id: string; result?: Promise<{ output?: unknown; stopReason?: string }>; dispose?: () => Promise<void> | void } }> {
+  const activationCapable = subagents as unknown as {
+    startActivation?: (spec: Record<string, unknown>) => Promise<{ childId: string }>
+  }
+  if (typeof subagents.start === 'function') {
+    return { detached: false, run: await subagents.start(providerName, request) }
+  }
+  if (typeof activationCapable.startActivation === 'function') {
+    const started = await activationCapable.startActivation({
+      provider: providerName,
+      label: request.label,
+      request,
+      signal: request.signal,
+      delivery: 'parent',
+    })
+    return { detached: true, run: { id: started.childId } }
+  }
+  throw new Error('pstack_spawn requires ctx.subagents.start() or ctx.subagents.startActivation()')
+}
+
 export function spawnTool(host: ToolHost): ToolDefinition {
   return {
     name: TOOL_SPAWN,
@@ -199,10 +230,19 @@ export function spawnTool(host: ToolHost): ToolDefinition {
         return { kind: 'continuable', subagentId: started.childId, role: resolved.role, inherit: resolved.inherit }
       }
 
-      const run = await subagents.start(providerName, request)
+      const started = await startPstackRun(subagents, providerName, request)
+      const run = started.run
       remember(run.id)
-      if (resolved.runInBackground) {
-        return { kind: 'foreground-detached', runId: run.id, role: resolved.role, inherit: resolved.inherit }
+      if (resolved.runInBackground || started.detached) {
+        return {
+          kind: 'foreground-detached',
+          runId: run.id,
+          role: resolved.role,
+          inherit: resolved.inherit,
+          ...started.detached && !resolved.runInBackground
+            ? { note: 'This DSH build has no blocking subagent run handle; the child started detached and reports back as a message.' }
+            : {},
+        }
       }
       const result = await run.result
       await Promise.resolve(run.dispose?.())
